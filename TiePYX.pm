@@ -7,7 +7,7 @@ use XML::Parser;
 
 use base 'Tie::Handle';
 
-$VERSION = '0.04';
+$VERSION = '0.05';
 
 sub TIEHANDLE {
   my $class=shift;
@@ -230,7 +230,7 @@ sub nsname {
     my $ns=$parser->namespace($name)||'';
     $name="{$ns}".$name;
   }
-  return $name;    
+  return $self->encode($name);    
 }
 
 sub encode {

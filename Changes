@@ -10,4 +10,6 @@ Revision history for Perl extension XML::TiePYX.
 	- added Latin output mode
 	- added write mode
 	- added catalog option
+0.05  Fri Jun 1 06:00:00 2001
+        - Latin output now applies to tag and attribute names (bug fix)
 
