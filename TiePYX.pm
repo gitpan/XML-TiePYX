@@ -1,20 +1,23 @@
 package XML::TiePYX;
 use strict;
-use vars qw($VERSION @ISA);
+use vars qw($VERSION);
 use Carp;
 use IO::File;
 use XML::Parser;
 
-require Tie::Handle;
-@ISA='Tie::Handle';
+use base 'Tie::Handle';
 
-$VERSION = '0.03';
+$VERSION = '0.04';
 
 sub TIEHANDLE {
-  my ($class,$source,%args)=@_;
-  my $self={output=>[],EOF=>0,offset=>0,condense=>1};
+  my $class=shift;
+  my $source=shift;
+  my %args=(Condense=>1,Validating=>0,Latin=>0,Catalog=>0,@_);
+  my $self={output=>[],EOF=>0,offset=>0,in_tag=>0};
   my $parser;
-  $self->{condense}=delete $args{Condense} if exists $args{Condense};
+  $self->{condense}=delete $args{Condense};
+  $self->{latin}=delete $args{Latin};
+  my $catname=delete $args{Catalog};
   if ($args{Validating}) {
     require XML::Checker::Parser;
     $parser=XML::Checker::Parser->new(%args) or croak "$!";
@@ -22,6 +25,11 @@ sub TIEHANDLE {
     $parser=XML::Parser->new(%args) or croak "$!";
   }
   $parser->setHandlers(Start=>\&start,End=>\&end,Char=>\&char,Proc=>\&proc);
+  if ($catname) {
+    require XML::Catalog;
+    my $catalog=XML::Catalog->new($catname) or croak "$!";
+    $parser->setHandlers(ExternEnt=>$catalog->get_handler($parser));
+  }
   $self->{parser}=$parser->parse_start(TiePYX=>$self) or croak "$!";  
   if (ref($source) eq 'SCALAR') {
     $self->{src}=$source;
@@ -86,13 +94,76 @@ sub READ {
   return length($buf);
 }
 
+sub PRINTF {
+  my $self=shift;
+  my $fmt=shift;
+  my $buf=sprintf($fmt,@_);
+  $self->WRITE($buf,length($buf),0);
+}
+
+sub WRITE {
+  my ($self,$data)=@_;
+  if ($self->{latin} && $self->{offset}==0) {
+    $self->output(qq{<?xml version="1.0" encoding="ISO-8859-1"?>\n});
+  }
+  ++$self->{offset};
+  foreach my $line (split /\n/,$data) {
+    my $type=substr($line,0,1);
+    $line=substr($line,1);
+    if ($type eq 'A') {
+      my ($attr,$val)=split(/\s+/,$line,2);
+      my $quote='"';
+      $self->output(" $attr=",0);
+      if ($val=~tr/"//) {
+        $quote="'";
+        $val=~s/'/&apos;/g if $val=~tr/'//;
+      }
+      $self->output("${quote}$val$quote",1);
+      next;
+    }
+    if ($self->{in_tag}) {
+      $self->output('>',0);
+      $self->{in_tag}=0;
+    }
+    if ($type eq '(') {
+      $self->output("<$line",0);
+      $self->{in_tag}=1;
+    }
+    elsif ($type eq ')') {
+      $self->output("</$line>",0);
+    }
+    elsif ($type eq '-') {
+      $self->output($line,1);
+    }
+    elsif ($type eq '?') {
+      $self->output('<?',0);
+      $self->output($line,1);
+      $self->output('?>',0);
+    }
+  }
+}
+
+sub output {
+  my ($self,$line,$encode)=@_;
+  my %enc=('&'=>'&amp;','<'=>'&lt;','>'=>'&gt;');
+  my $enc=join '',keys %enc;
+  $line=~s/\\n/\n/g;
+  $line=~s/([$enc])(?!apos)/$enc{$1}/go if $encode;
+  if (exists $self->{src}) {
+    ${$self->{src}}.=$line;
+  }
+  else {
+    $self->{srcfile}->print($line);
+  }
+}
+
 sub parsechunks {
   my ($self,$goforit)=@_;
   my $buf;
   while ((!@{$self->{output}}
          || (substr($self->{output}[-1],0,1) eq '-' && $self->{condense})
          || $goforit)
-	 && !$self->{EOF}) {
+         && !$self->{EOF}) {
     if (exists $self->{src}) {
       $buf=substr(${$self->{src}},$self->{src_offset},4096);
       $self->{src_offset}+=4096;
@@ -119,7 +190,7 @@ sub start {
   push @{$self->{output}},'('.$self->nsname($element)."\n";
   while (@attrs) {
     my ($name,$val)=(shift @attrs,shift @attrs);
-    push @{$self->{output}},'A'.$self->nsname($name).' '.encode($val)."\n";
+    push @{$self->{output}},'A'.$self->nsname($name).' '.$self->encode($val)."\n";
   }
 }
 
@@ -136,10 +207,10 @@ sub char {
   my ($parser,$text)=@_;
   my $self=$parser->{TiePYX};
   if (@{$self->{output}} && substr($self->{output}[-1],0,1) eq '-' && $self->{condense}) {
-    $self->{output}[-1].=encode($text);
+    $self->{output}[-1].=$self->encode($text);
   }
   else {
-    push @{$self->{output}},'-'.encode($text).($self->{condense}?'':"\n");
+    push @{$self->{output}},'-'.$self->encode($text).($self->{condense}?'':"\n");
   }
 }
 
@@ -149,7 +220,7 @@ sub proc {
   if (@{$self->{output}} && substr($self->{output}[-1],0,1) eq '-' && $self->{condense}) {
     $self->{output}[-1].="\n";
   }
-  push @{$self->{output}},"?$target ".encode($value)."\n";
+  push @{$self->{output}},"?$target ".$self->encode($value)."\n";
 }
 
 sub nsname {
@@ -163,8 +234,15 @@ sub nsname {
 }
 
 sub encode {
-  my $text=shift;
+  my ($self,$text)=@_;
   $text=~s/\x0a/\\n/g;
+  if ($self->{latin}) {
+    $text=~s{([\xc0-\xc3])(.)}{
+      my $hi = ord($1);
+      my $lo = ord($2);
+      chr((($hi & 0x03) <<6) | ($lo & 0x3F))
+     }ge;
+  }
   return $text;
 }
 
@@ -173,7 +251,7 @@ __END__
 
 =head1 NAME
 
-XML::TiePYX - Read XML data in PYX format via tied filehandle
+XML::TiePYX - Read or write XML data in PYX format via tied filehandle
 
 =head1 SYNOPSIS
 
@@ -187,12 +265,16 @@ XML::TiePYX - Read XML data in PYX format via tied filehandle
   my $text='<tag xmlns="http://www.omsdev.com">text</tag>';
   tie *XML,'XML::TiePYX',\$text,Namespaces=>1;
 
+  tie *XML,'XML::TiePYX',\*STDOUT;
+  print XML "(start\n","-Hello, world!\n",")start\n";
+
 =head1 DESCRIPTION
 
-XML::TiePYX lets you read an XML file or string in PYX format from a tied 
-filehandle.  PYX is a line-oriented, parsed representation of XML developed 
-by Sean McGrath (http://www.pyxie.org).  Each line corresponds to one 
-"event" in the XML, with the first character indicating the type of event:
+XML::TiePYX lets you use a tied filehandle to read from or write to an XML 
+file or string.  PYX is a line-oriented, parsed representation of XML 
+developed by Sean McGrath (http://www.pyxie.org).  Each line corresponds to 
+one "event" in the XML, with the first character indicating the type of 
+event:
 
 =over 4
 
@@ -202,7 +284,8 @@ The start of an element; the rest of the line is its name.
 
 =item A
 
-An attribute; the rest of the line is the attribute's name, a space, and its value.
+An attribute; the rest of the line is the attribute's name, a space, and 
+its value.
 
 =item )
 
@@ -214,15 +297,16 @@ Literal text (characters).  The rest of the line is the text.
 
 =item ?
 
-A processing instruction.  The rest of the line is the instruction's target, a space, and the instruction's value.
+A processing instruction.  The rest of the line is the instruction's 
+target, a space, and the instruction's value.
 
 =back
 
 Newlines in attribute values, text, and processing instruction values are 
 represented as the literal sequence '\n' (that is, a backslash followed by 
 an 'n').  By default, consecutive runs of characters are always gathered 
-into a single text event, but this behavior can be disabled.  Comments are 
-*not* available through PYX.
+into a single text event when reading, but this behavior can be disabled.  
+Comments are *not* available through PYX.
 
 Just as SAX is an API well suited to "push"-mode XML parsing, PYX is well- 
 suited to "pull"-mode parsing where you want to capture the state of the 
@@ -234,31 +318,61 @@ This module implements an (unofficial) extension to the PYX format to allow
 namespace processing.  If namespaces are enabled, an element or attribute 
 name will be prefixed by its namespace URI (*NOT* any namespace prefix used 
 in the document) enclosed in curly braces.  A name with no namespace will 
-be prefixed with {}.
+be prefixed with {}.  At the present time, this module does not implement 
+namespace processing in output mode; attempting to write '(', ')', or 'A' 
+lines that contain a namespace URI in curly braces will merely result in 
+generating ill-formed element or attribute names.
 
 
 =head1 INTERFACE
 
   tie *tied_handle, 'XML::TiePYX', source, [Option=>value,...]
 
-I<tied_handle> is the filehandle from which the PYX events will be read.  
+I<tied_handle> is the filehandle which the PYX events will be read from or 
+written to.  
 
 I<source> is either a reference to a string containing the XML, the name of 
 a file containing the XML, or an open IO::Handle or filehandle glob 
-reference from which the XML can be read.
+reference which the XML can be read or written to.
 
 The I<Option>s can be any options allowed by XML::Parser and 
-XML::Parser::Expat, as well as two module-specific options.  I<Validating> 
-will provide a validating parse by using XML::Checker::Parser in place of 
-XML::Parser if set to a true value.  I<Condense>, if set to a true value 
-(the default), causes all consecutive runs of character data to be gathered 
-up into a single PYX event.  If set false, multiple consecutive character 
-data events may occur in the stream (which may be desirable when dealing 
-with large chunks of text).
+XML::Parser::Expat, as well as four module-specific options:
 
-The tied filehandle may be read from using either the diamond operator 
+=over 4
+
+=item I<Validating>
+
+This will provide a validating parse by using XML::Checker::Parser 
+in place of XML::Parser if set to a true value.
+
+=item I<Condense>
+
+Causes all consecutive runs of character data to be gathered up into a 
+single PYX event if set to a true value (the default).  If set false, 
+multiple consecutive character data events may occur in the stream (which 
+may be desirable when dealing with large chunks of text).  This option has 
+no effect when writing.
+
+=item I<Latin>
+
+If set to a true value, causes Unicode characters in the range 128-255 to 
+be returned as ISO-Latin-1 characters rather than UTF-8 characters when 
+reading, and an XML declaration specifying an encoding of "ISO-8859-1" to 
+be output when writing.
+
+=item I<Catalog>
+
+Specifies the URL of a catalog to use for resolving public identifiers and 
+remapping system identifiers used in document type declarations or external 
+entity references.  This option requires XML::Catalog to be installed.
+
+=back
+
+The tied filehandle may be read from with either the diamond operator 
 (<HANDLE>), getc(), or read().  The diamond operator always returns a line 
-at a time regardless of the setting of $/.
+at a time regardless of the setting of $/.  It may be written to with 
+print() or printf(); it is necessary to print one or more complete PYX 
+lines at a time.  This module does not support read/write mode.
 
 =head1 EXAMPLE
 
@@ -348,12 +462,6 @@ does not implement the parse_start() method.
 
 Error handling leaves much to be desired.
 
-=head1 TODO
-
-Write mode (PYX to XML).
-
-Public ID translation using XML::Catalog;
-
 =head1 AUTHOR
 
 Eric Bohlman (ebohlman@netcom.com, ebohlman@omsdev.com)
@@ -371,6 +479,7 @@ same terms as Perl itself.
   XML::Parser
   XML::Parser::Expat
   XML::Checker
+  XML::Catalog
   perl(1).
 
 =cut

@@ -11,7 +11,7 @@
 
   die "usage: psect [-c] file\n" unless @ARGV==1;
 
-  tie *XML,'XML::TiePYX',$ARGV[0] or die "couldn't open $ARGV[0]: $!";
+  tie *XML,'XML::TiePYX',$ARGV[0],Latin=>1 or die "couldn't open $ARGV[0]: $!";
   die "illegal structure" unless get_event() =~ /^\(outline/;
   push @sectnums,0;
   print_sect() while get_event() =~ /^\(sect/;

@@ -6,4 +6,8 @@ Revision history for Perl extension XML::TiePYX.
 	- made condensation of consecutive text optional
 0.03  Sat Sep  2 01:00:00 2000
 	- fixed minor bugs
+0.04  Thu Sep 21 09:20:00 2000
+	- added Latin output mode
+	- added write mode
+	- added catalog option
 
